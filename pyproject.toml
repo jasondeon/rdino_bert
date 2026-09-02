@@ -1,0 +1,20 @@
+[project]
+name = "rdino-bert"
+version = "0.1.0"
+description = "Multimodal BERT and RDINO training for windowed speech data"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "numpy>=1.24,<3",
+    "pandas>=2.0,<3",
+    "peft>=0.11,<1",
+    "pyyaml>=6,<7",
+    "scikit-learn>=1.3,<2",
+    "scipy>=1.10,<2",
+    "torch>=2.1,<3",
+    "torchaudio>=2.1,<3",
+    "transformers>=4.40,<5",
+]
+
+[tool.uv]
+package = false

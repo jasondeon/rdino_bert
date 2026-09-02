@@ -1,0 +1,3 @@
+audio_path,word_timestamps_path,class_label,regression_label,subject_id
+relative/path/to/001.wav,relative/path/to/001.words.json,1,-0.32,001
+relative/path/to/002.wav,relative/path/to/002.words.json,0,0.08,002

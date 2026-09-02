@@ -1,0 +1,25 @@
+# Architecture configuration from modelscope/3D-Speaker RDINO recipe.
+n_mels: 80
+embed_dim: 512
+out_dim: 65536
+use_bn_in_head: True
+
+teacher_ecapa:
+  obj: speakerlab.models.rdino.ECAPA_TDNN.ECAPA_TDNN
+  args:
+    input_size: <n_mels>
+    channels: [1024, 1024, 1024, 1024, 3072]
+
+teacher_head:
+  obj: speakerlab.models.rdino.RDINO_Head.RDINOHead
+  args:
+    in_dim: <embed_dim>
+    out_dim: <out_dim>
+    use_bn: <use_bn_in_head>
+
+teacher_model:
+  obj: speakerlab.models.rdino.combiner.Combiner
+  args:
+    backbone: <teacher_ecapa>
+    head: <teacher_head>
+

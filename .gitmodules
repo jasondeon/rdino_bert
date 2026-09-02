@@ -1,0 +1,3 @@
+[submodule "vendor/3D-Speaker"]
+	path = vendor/3D-Speaker
+	url = https://github.com/modelscope/3D-Speaker.git
