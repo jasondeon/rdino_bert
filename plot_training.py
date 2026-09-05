@@ -31,7 +31,21 @@ def main() -> None:
         epochs, history["validation_total_loss"], marker="o", label="Validation"
     )
     axes[0, 0].set(title="Combined loss", xlabel="Epoch", ylabel="Loss")
-    axes[0, 0].legend()
+    loss_lines = axes[0, 0].lines
+    if "learning_rate" in history.columns:
+        learning_rate_axis = axes[0, 0].twinx()
+        learning_rate_axis.plot(
+            epochs,
+            history["learning_rate"],
+            color="tab:green",
+            linestyle=":",
+            marker="x",
+            label="Learning rate",
+        )
+        learning_rate_axis.set_ylabel("Learning rate")
+        learning_rate_axis.set_yscale("log")
+        loss_lines += learning_rate_axis.lines
+    axes[0, 0].legend(loss_lines, [line.get_label() for line in loss_lines])
 
     for split, style in (("train", "-"), ("validation", "--")):
         axes[0, 1].plot(

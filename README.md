@@ -113,6 +113,20 @@ python train.py `
 Use `python train.py --help` for all options. Checkpoints include the model
 configuration and text-model identifier, rather than only parameter tensors.
 
+Pass `--augment-audio` to apply runtime audio augmentation to training windows
+only. By default, AWGN is applied with probability 0.5 at a uniformly sampled
+10--30 dB SNR, and synthetic room reverb is applied independently with
+probability 0.3. Reverb uses a randomized 0.2--0.8 second RT60 and 0.1--0.4 wet
+mix. All ranges and probabilities have corresponding command-line options.
+Validation and inference waveforms remain clean. The settings are written to
+`audio_augmentation.json` and saved in the best checkpoint.
+
+Pass `--stride-jitter-seconds 2` to randomly shift each training window start by
+up to two seconds on every access. The shifted audio and word-timestamp transcript
+remain aligned, and the crop is clamped to its original uninterrupted
+primary-speaker run. Validation windows are never jittered. The nominal window
+count and stride remain unchanged.
+
 Pass `--standardize-regression-labels` to fit the regression-label mean and
 population standard deviation on the training recordings only. Validation
 targets are kept on their original scale, and predictions are converted back to
@@ -129,9 +143,23 @@ and regression outputs are averaged across a recording's windows before scoring.
 Window predictions are written to `predictions_epoch_N.csv`, while aggregated
 predictions are written to `recording_predictions_epoch_N.csv`.
 
-Training stops by default after five epochs without improvement in recording-level
-regression R² and writes the best model to `best_checkpoint.pt`. Adjust this with
-`--early-stopping-patience` and `--early-stopping-min-delta`.
+Training stops by default after five epochs without improvement in
+recording-level regression R² and writes the best model to `best_checkpoint.pt`.
+Adjust this with `--early-stopping-patience` and `--early-stopping-min-delta`.
+
+A plateau scheduler monitors recording-level validation R² by default. After its
+configured patience it multiplies the learning rate by 0.5, down to `1e-7`.
+Configure it with `--lr-scheduler-factor`, `--lr-scheduler-patience`, and
+`--min-learning-rate`, or disable it with `--lr-scheduler none`. The per-epoch
+learning rate is stored in `training_history.csv`; scheduler configuration and
+state are saved in `lr_scheduler.json` and `best_checkpoint.pt`.
+
+Classification losses use square-root inverse-frequency class weights by default.
+The frequencies are fitted only on eligible training examples and match the active
+sampling unit: recordings with `--train-sampling recording`, or windows with
+`--train-sampling window`. The weights are normalized to have mean sample weight
+one and saved to `classification_weighting.json` and the best checkpoint. Pass
+`--class-weighting none` to recover unweighted classification loss.
 
 The supplied RDINO recipe uses the mel-spectrogram frontend.
 

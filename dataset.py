@@ -60,6 +60,9 @@ class Window:
     text: str
     source_spans: tuple[SourceSpan, ...]
     speaker: str
+    speaker_group: tuple[SourceSpan, ...]
+    local_start_seconds: float
+    group_duration_seconds: float
 
 
 def _resolve_path(value: str, manifest_dir: Path) -> Path:
@@ -305,13 +308,19 @@ class MultimodalDataset(Dataset[dict[str, Any]]):
         stride_seconds: float = 20.0,
         num_classes: int = 2,
         include_empty_text: bool = False,
+        window_jitter_seconds: float = 0.0,
     ) -> None:
         if window_seconds <= 0 or stride_seconds <= 0:
             raise ValueError("window_seconds and stride_seconds must be positive")
+        if window_jitter_seconds < 0:
+            raise ValueError("window_jitter_seconds cannot be negative")
         self.recordings = read_manifest(manifest_path, num_classes=num_classes)
         self.sample_rate = sample_rate
         self.window_seconds = window_seconds
+        self.window_jitter_seconds = window_jitter_seconds
+        self.include_empty_text = include_empty_text
         self.target_samples = round(sample_rate * window_seconds)
+        self.words_by_recording: list[list[TimedWord]] = []
         self.windows: list[Window] = []
         self.skipped_short_recordings = 0
 
@@ -325,6 +334,7 @@ class MultimodalDataset(Dataset[dict[str, Any]]):
             metadata = sf.info(recording.audio_path)
             duration = metadata.frames / metadata.samplerate
             words = read_word_timestamps(recording.word_timestamps_path)
+            self.words_by_recording.append(words)
             diarization = read_diarization(recording.diarization_path)
             primary_speaker, speaker_groups = _primary_speaker_groups(diarization)
             speaker_groups = [
@@ -360,6 +370,9 @@ class MultimodalDataset(Dataset[dict[str, Any]]):
                                 text,
                                 source_spans,
                                 primary_speaker,
+                                speaker_group,
+                                local_start,
+                                group_duration,
                             )
                         )
             if not has_eligible_segment:
@@ -375,9 +388,32 @@ class MultimodalDataset(Dataset[dict[str, Any]]):
     def __getitem__(self, index: int) -> dict[str, Any]:
         window = self.windows[index]
         recording = self.recordings[window.recording_index]
+        source_spans = window.source_spans
+        text = window.text
+        if self.window_jitter_seconds > 0:
+            offset = torch.empty(()).uniform_(
+                -self.window_jitter_seconds, self.window_jitter_seconds
+            ).item()
+            maximum_start = max(
+                0.0, window.group_duration_seconds - self.window_seconds
+            )
+            local_start = min(
+                maximum_start, max(0.0, window.local_start_seconds + offset)
+            )
+            jittered_spans = _source_spans_for_window(
+                window.speaker_group,
+                local_start,
+                local_start + self.window_seconds,
+            )
+            jittered_text = _words_in_spans(
+                self.words_by_recording[window.recording_index], jittered_spans
+            )
+            if jittered_text or self.include_empty_text:
+                source_spans = jittered_spans
+                text = jittered_text
         metadata = sf.info(recording.audio_path)
         pieces: list[torch.Tensor] = []
-        for span in window.source_spans:
+        for span in source_spans:
             frame_offset = max(0, math.floor(span.start_seconds * metadata.samplerate))
             frame_end = min(
                 metadata.frames, math.ceil(span.end_seconds * metadata.samplerate)
@@ -400,7 +436,8 @@ class MultimodalDataset(Dataset[dict[str, Any]]):
             pieces.append(waveform)
         if not pieces:
             raise ValueError(
-                f"Window {window.start_seconds:.6f}..{window.end_seconds:.6f} has no "
+                f"Window {source_spans[0].start_seconds:.6f}.."
+                f"{source_spans[-1].end_seconds:.6f} has no "
                 f"readable audio frames in {recording.audio_path}"
             )
         waveform = torch.cat(pieces)
@@ -408,14 +445,14 @@ class MultimodalDataset(Dataset[dict[str, Any]]):
         return {
             "recording_index": window.recording_index,
             "waveform": waveform,
-            "text": window.text,
+            "text": text,
             "class_label": recording.class_label,
             "regression_label": recording.regression_label,
             "audio_path": str(recording.audio_path),
             "subject_id": recording.subject_id,
             "speaker": window.speaker,
-            "window_start": window.start_seconds,
-            "window_end": window.end_seconds,
+            "window_start": source_spans[0].start_seconds,
+            "window_end": source_spans[-1].end_seconds,
         }
 
 

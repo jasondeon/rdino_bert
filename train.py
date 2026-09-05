@@ -17,9 +17,11 @@ from sklearn.metrics import (
     r2_score,
 )
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Sampler
 from transformers import AutoTokenizer
 
+from augmentation import WaveformAugmenter
 from dataset import MultimodalCollator, MultimodalDataset
 from model import BertRdinoModel
 
@@ -89,6 +91,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=3e-5)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument(
+        "--lr-scheduler",
+        choices=("plateau", "none"),
+        default="plateau",
+        help="Learning-rate schedule (default: plateau on validation R-squared)",
+    )
+    parser.add_argument("--lr-scheduler-factor", type=float, default=0.5)
+    parser.add_argument("--lr-scheduler-patience", type=int, default=2)
+    parser.add_argument("--min-learning-rate", type=float, default=1e-7)
+    parser.add_argument(
         "--early-stopping-patience",
         type=int,
         default=5,
@@ -97,10 +108,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--early-stopping-min-delta", type=float, default=0.0)
     parser.add_argument("--window-seconds", type=float, default=55.0)
     parser.add_argument("--stride-seconds", type=float, default=10.0)
+    parser.add_argument(
+        "--stride-jitter-seconds",
+        type=float,
+        default=0.0,
+        help="Randomly shift each training window start by up to this many seconds",
+    )
     parser.add_argument("--include-empty-text", action="store_true")
     parser.add_argument("--max-text-tokens", type=int, default=512)
+    parser.add_argument(
+        "--augment-audio",
+        action="store_true",
+        help="Apply training-only AWGN and synthetic room reverb",
+    )
+    parser.add_argument("--awgn-probability", type=float, default=0.5)
+    parser.add_argument("--awgn-snr-min-db", type=float, default=10.0)
+    parser.add_argument("--awgn-snr-max-db", type=float, default=30.0)
+    parser.add_argument("--reverb-probability", type=float, default=0.3)
+    parser.add_argument("--reverb-rt60-min-seconds", type=float, default=0.2)
+    parser.add_argument("--reverb-rt60-max-seconds", type=float, default=0.8)
+    parser.add_argument("--reverb-wet-min", type=float, default=0.1)
+    parser.add_argument("--reverb-wet-max", type=float, default=0.4)
     parser.add_argument("--num-classes", type=int, default=4)
     parser.add_argument("--classification-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--class-weighting",
+        choices=("sqrt_inverse_frequency", "none"),
+        default="sqrt_inverse_frequency",
+        help="Per-class weighting for classification losses (default: sqrt inverse frequency)",
+    )
     parser.add_argument("--regression-weight", type=float, default=1.0)
     parser.add_argument(
         "--standardize-regression-labels",
@@ -132,6 +168,43 @@ def _regression_standardization(train_data, enabled: bool) -> dict[str, float | 
     if not np.isfinite(std) or std <= 0:
         raise ValueError("Cannot standardize regression labels because training std is zero")
     return {"enabled": True, "mean": mean, "std": std}
+
+
+def _classification_weighting(
+    train_data: MultimodalDataset, num_classes: int, sampling: str, method: str
+) -> dict[str, str | list[int] | list[float]]:
+    if sampling == "recording":
+        eligible_recordings = sorted(
+            {window.recording_index for window in train_data.windows}
+        )
+        labels = [
+            train_data.recordings[index].class_label for index in eligible_recordings
+        ]
+        sampling_unit = "eligible_recordings"
+    else:
+        labels = [
+            train_data.recordings[window.recording_index].class_label
+            for window in train_data.windows
+        ]
+        sampling_unit = "windows"
+
+    counts = np.bincount(labels, minlength=num_classes).astype(np.float64)
+    if len(counts) != num_classes or np.any(counts == 0):
+        missing = np.flatnonzero(counts == 0).tolist()
+        raise ValueError(f"Cannot weight classification because classes are absent: {missing}")
+    if method == "sqrt_inverse_frequency":
+        weights = 1.0 / np.sqrt(counts)
+        weights /= np.average(weights, weights=counts)
+    elif method == "none":
+        weights = np.ones(num_classes, dtype=np.float64)
+    else:
+        raise ValueError(f"Unknown class-weighting method: {method}")
+    return {
+        "method": method,
+        "sampling_unit": sampling_unit,
+        "counts": counts.astype(int).tolist(),
+        "weights": weights.tolist(),
+    }
 
 
 def _standardize_regression(
@@ -201,6 +274,7 @@ def evaluate(
     device,
     output_path: Path,
     standardization: dict[str, float | bool],
+    class_weights: list[float],
     classification_weight: float = 1.0,
     regression_weight: float = 1.0,
 ) -> dict[str, float]:
@@ -276,8 +350,12 @@ def evaluate(
     ].to_numpy()
     regression_truth = recording_frame["regression_truth"].to_numpy()
     regression_predictions = recording_frame["regression_prediction"].to_numpy()
+    negative_log_likelihood = -np.log(
+        mean_probabilities[np.arange(len(class_truth)), class_truth].clip(1e-12)
+    )
+    validation_class_weights = np.asarray(class_weights, dtype=np.float64)[class_truth]
     classification_loss = float(
-        -np.log(mean_probabilities[np.arange(len(class_truth)), class_truth].clip(1e-12)).mean()
+        np.average(negative_log_likelihood, weights=validation_class_weights)
     )
     regression_loss = float(mean_squared_error(standardized_truth, standardized_predictions))
     regression_rmse = float(np.sqrt(regression_loss))
@@ -310,6 +388,37 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    augmentation_config = {
+        "enabled": args.augment_audio,
+        "awgn_probability": args.awgn_probability,
+        "awgn_snr_min_db": args.awgn_snr_min_db,
+        "awgn_snr_max_db": args.awgn_snr_max_db,
+        "reverb_probability": args.reverb_probability,
+        "reverb_rt60_min_seconds": args.reverb_rt60_min_seconds,
+        "reverb_rt60_max_seconds": args.reverb_rt60_max_seconds,
+        "reverb_wet_min": args.reverb_wet_min,
+        "reverb_wet_max": args.reverb_wet_max,
+    }
+    (args.output_dir / "audio_augmentation.json").write_text(
+        json.dumps(augmentation_config, indent=2) + "\n", encoding="utf-8"
+    )
+    audio_augmenter = (
+        WaveformAugmenter(
+            sample_rate=16_000,
+            awgn_probability=args.awgn_probability,
+            awgn_snr_min_db=args.awgn_snr_min_db,
+            awgn_snr_max_db=args.awgn_snr_max_db,
+            reverb_probability=args.reverb_probability,
+            reverb_rt60_min_seconds=args.reverb_rt60_min_seconds,
+            reverb_rt60_max_seconds=args.reverb_rt60_max_seconds,
+            reverb_wet_min=args.reverb_wet_min,
+            reverb_wet_max=args.reverb_wet_max,
+        )
+        if args.augment_audio
+        else None
+    )
+    if audio_augmenter is not None:
+        print(f"Training audio augmentation: {json.dumps(augmentation_config)}")
     tokenizer = AutoTokenizer.from_pretrained(args.text_model)
     collator = MultimodalCollator(tokenizer, args.max_text_tokens)
     common = dict(
@@ -319,8 +428,28 @@ def main() -> None:
         num_classes=args.num_classes,
         include_empty_text=args.include_empty_text,
     )
-    train_data = MultimodalDataset(args.train_manifest, **common)
+    train_data = MultimodalDataset(
+        args.train_manifest,
+        window_jitter_seconds=args.stride_jitter_seconds,
+        **common,
+    )
     validation_data = MultimodalDataset(args.validation_manifest, **common)
+    if args.stride_jitter_seconds > 0:
+        print(
+            "Training window-start jitter: "
+            f"+/-{args.stride_jitter_seconds:g} seconds"
+        )
+    classification_weighting = _classification_weighting(
+        train_data, args.num_classes, args.train_sampling, args.class_weighting
+    )
+    (args.output_dir / "classification_weighting.json").write_text(
+        json.dumps(classification_weighting, indent=2) + "\n", encoding="utf-8"
+    )
+    print(
+        f"Classification weighting ({classification_weighting['sampling_unit']}): "
+        f"counts={classification_weighting['counts']}, "
+        f"weights={[round(value, 6) for value in classification_weighting['weights']]}"
+    )
     regression_standardization = _regression_standardization(
         train_data, args.standardize_regression_labels
     )
@@ -404,14 +533,49 @@ def main() -> None:
     trainable, total = model.trainable_parameter_counts()
     print(f"Device: {device}; trainable parameters: {trainable:,}/{total:,}")
 
-    classification_loss = torch.nn.CrossEntropyLoss()
-    recording_classification_loss = torch.nn.NLLLoss()
+    class_weight_tensor = torch.tensor(
+        classification_weighting["weights"], dtype=torch.float32, device=device
+    )
+    classification_loss = torch.nn.CrossEntropyLoss(weight=class_weight_tensor)
+    recording_classification_loss = torch.nn.NLLLoss(weight=class_weight_tensor)
     regression_loss = torch.nn.MSELoss()
     optimizer = AdamW(
         (parameter for parameter in model.parameters() if parameter.requires_grad),
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
     )
+    if not 0.0 < args.lr_scheduler_factor < 1.0:
+        raise ValueError("--lr-scheduler-factor must be between 0 and 1")
+    if args.lr_scheduler_patience < 0:
+        raise ValueError("--lr-scheduler-patience cannot be negative")
+    if not 0.0 <= args.min_learning_rate <= args.learning_rate:
+        raise ValueError("--min-learning-rate must be between 0 and --learning-rate")
+    scheduler_config = {
+        "name": args.lr_scheduler,
+        "monitor": "validation_regression_r2",
+        "mode": "max",
+        "factor": args.lr_scheduler_factor,
+        "patience": args.lr_scheduler_patience,
+        "threshold": args.early_stopping_min_delta,
+        "min_learning_rate": args.min_learning_rate,
+    }
+    (args.output_dir / "lr_scheduler.json").write_text(
+        json.dumps(scheduler_config, indent=2) + "\n", encoding="utf-8"
+    )
+    scheduler = (
+        ReduceLROnPlateau(
+            optimizer,
+            mode="max",
+            factor=args.lr_scheduler_factor,
+            patience=args.lr_scheduler_patience,
+            threshold=args.early_stopping_min_delta,
+            threshold_mode="abs",
+            min_lr=args.min_learning_rate,
+        )
+        if args.lr_scheduler == "plateau"
+        else None
+    )
+    print(f"Learning-rate scheduler: {json.dumps(scheduler_config)}")
 
     if args.early_stopping_patience < 1:
         raise ValueError("--early-stopping-patience must be at least 1")
@@ -419,10 +583,13 @@ def main() -> None:
     best_validation_r2 = float("-inf")
     epochs_without_improvement = 0
     for epoch in range(args.epochs):
+        epoch_learning_rate = float(optimizer.param_groups[0]["lr"])
         model.train()
         total_losses, classification_losses, regression_losses = [], [], []
         for batch_number, batch in enumerate(train_loader, start=1):
             tokens, waveforms, class_labels, regression_labels = move_batch(batch, device)
+            if audio_augmenter is not None:
+                waveforms = audio_augmenter(waveforms)
             class_logits, regression_output = model(tokens, waveforms)
             if recording_level_training:
                 (
@@ -469,11 +636,22 @@ def main() -> None:
             device,
             prediction_path,
             regression_standardization,
-            args.classification_weight,
-            args.regression_weight,
+            class_weights=classification_weighting["weights"],
+            classification_weight=args.classification_weight,
+            regression_weight=args.regression_weight,
         )
+        if scheduler is not None:
+            scheduler.step(metrics["regression_r2"])
+        next_learning_rate = float(optimizer.param_groups[0]["lr"])
+        if next_learning_rate < epoch_learning_rate:
+            print(
+                f"Reduced learning rate: {epoch_learning_rate:.8g} -> "
+                f"{next_learning_rate:.8g}"
+            )
         history.append({
             "epoch": epoch + 1,
+            "learning_rate": epoch_learning_rate,
+            "next_learning_rate": next_learning_rate,
             "train_total_loss": float(np.mean(total_losses)),
             "train_classification_loss": float(np.mean(classification_losses)),
             "train_regression_loss": float(np.mean(regression_losses)),
@@ -490,6 +668,9 @@ def main() -> None:
             "validation_regression_r2": metrics["regression_r2"],
         })
         pd.DataFrame(history).to_csv(args.output_dir / "training_history.csv", index=False)
+        print(f"epoch={epoch + 1} mean_train_loss={np.mean(total_losses):.6f}")
+        print(json.dumps(metrics, indent=2))
+
         validation_r2 = metrics["regression_r2"]
         improved = validation_r2 > best_validation_r2 + args.early_stopping_min_delta
         if improved:
@@ -502,25 +683,26 @@ def main() -> None:
             "model_config": model_config,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+            "scheduler_config": scheduler_config,
             "metrics": metrics,
             "history": history,
             "best_validation_r2": best_validation_r2,
             "epochs_without_improvement": epochs_without_improvement,
             "regression_standardization": regression_standardization,
+            "classification_weighting": classification_weighting,
+            "audio_augmentation": augmentation_config,
             "training_arguments": vars(args),
         }
         if improved:
             checkpoint_path = args.output_dir / "best_checkpoint.pt"
             torch.save(checkpoint, checkpoint_path)
-        print(f"epoch={epoch + 1} mean_train_loss={np.mean(total_losses):.6f}")
-        print(json.dumps(metrics, indent=2))
-        if improved:
             print(f"Saved {checkpoint_path}")
             print(f"New best recording-level regression R-squared: {best_validation_r2:.6f}")
         if epochs_without_improvement >= args.early_stopping_patience:
             print(
-                f"Early stopping after {args.early_stopping_patience} epochs without "
-                "recording-level regression R-squared improvement"
+                f"Early stopping after {args.early_stopping_patience} epochs "
+                "without recording-level regression R-squared improvement"
             )
             break
 
