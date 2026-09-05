@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from dataset import read_manifest, read_word_timestamps
+from dataset import read_diarization, read_manifest, read_word_timestamps
 
 
 def main() -> None:
@@ -20,7 +20,7 @@ def main() -> None:
         missing = [
             path
             for item in train + validation
-            for path in (item.audio_path, item.word_timestamps_path)
+            for path in (item.audio_path, item.word_timestamps_path, item.diarization_path)
             if not path.is_file()
         ]
         if missing:
@@ -28,6 +28,7 @@ def main() -> None:
             raise FileNotFoundError(f"{len(missing)} input files are missing. First paths:\n{preview}")
         for item in train + validation:
             read_word_timestamps(item.word_timestamps_path)
+            read_diarization(item.diarization_path)
 
     train_subjects = {item.subject_id for item in train if item.subject_id}
     validation_subjects = {item.subject_id for item in validation if item.subject_id}
