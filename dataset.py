@@ -309,16 +309,26 @@ class MultimodalDataset(Dataset[dict[str, Any]]):
         num_classes: int = 2,
         include_empty_text: bool = False,
         window_jitter_seconds: float = 0.0,
+        load_audio: bool = True,
+        eligibility_window_seconds: float | None = None,
     ) -> None:
         if window_seconds <= 0 or stride_seconds <= 0:
             raise ValueError("window_seconds and stride_seconds must be positive")
         if window_jitter_seconds < 0:
             raise ValueError("window_jitter_seconds cannot be negative")
+        if eligibility_window_seconds is not None and eligibility_window_seconds <= 0:
+            raise ValueError("eligibility_window_seconds must be positive")
         self.recordings = read_manifest(manifest_path, num_classes=num_classes)
         self.sample_rate = sample_rate
         self.window_seconds = window_seconds
         self.window_jitter_seconds = window_jitter_seconds
         self.include_empty_text = include_empty_text
+        self.load_audio = load_audio
+        self.eligibility_window_seconds = (
+            window_seconds
+            if eligibility_window_seconds is None
+            else eligibility_window_seconds
+        )
         self.target_samples = round(sample_rate * window_seconds)
         self.words_by_recording: list[list[TimedWord]] = []
         self.windows: list[Window] = []
@@ -346,13 +356,20 @@ class MultimodalDataset(Dataset[dict[str, Any]]):
                 for group in speaker_groups
             ]
             speaker_groups = [group for group in speaker_groups if group]
-            has_eligible_segment = False
+            group_durations = [
+                sum(span.end_seconds - span.start_seconds for span in group)
+                for group in speaker_groups
+            ]
+            if not any(
+                duration + 1e-8 >= self.eligibility_window_seconds
+                for duration in group_durations
+            ):
+                self.skipped_short_recordings += 1
+                continue
             for speaker_group in speaker_groups:
                 group_duration = sum(
                     span.end_seconds - span.start_seconds for span in speaker_group
                 )
-                if group_duration + 1e-8 >= window_seconds:
-                    has_eligible_segment = True
                 for local_start in _window_starts(
                     group_duration, window_seconds, stride_seconds
                 ):
@@ -375,8 +392,6 @@ class MultimodalDataset(Dataset[dict[str, Any]]):
                                 group_duration,
                             )
                         )
-            if not has_eligible_segment:
-                self.skipped_short_recordings += 1
         if not self.windows:
             raise ValueError(
                 "No windows were produced; check diarization segment durations and word timestamps"
@@ -411,37 +426,42 @@ class MultimodalDataset(Dataset[dict[str, Any]]):
             if jittered_text or self.include_empty_text:
                 source_spans = jittered_spans
                 text = jittered_text
-        metadata = sf.info(recording.audio_path)
-        pieces: list[torch.Tensor] = []
-        for span in source_spans:
-            frame_offset = max(0, math.floor(span.start_seconds * metadata.samplerate))
-            frame_end = min(
-                metadata.frames, math.ceil(span.end_seconds * metadata.samplerate)
-            )
-            frames = frame_end - frame_offset
-            if frames <= 0:
-                continue
-            samples, source_rate = sf.read(
-                recording.audio_path,
-                start=frame_offset,
-                frames=frames,
-                dtype="float32",
-                always_2d=True,
-            )
-            if samples.shape[0] == 0:
-                continue
-            waveform = torch.from_numpy(samples).mean(dim=1)
-            if source_rate != self.sample_rate:
-                waveform = torchaudio.functional.resample(waveform, source_rate, self.sample_rate)
-            pieces.append(waveform)
-        if not pieces:
-            raise ValueError(
-                f"Window {source_spans[0].start_seconds:.6f}.."
-                f"{source_spans[-1].end_seconds:.6f} has no "
-                f"readable audio frames in {recording.audio_path}"
-            )
-        waveform = torch.cat(pieces)
-        waveform = _repeat_to_length(waveform, self.target_samples)
+        waveform: torch.Tensor | None = None
+        if self.load_audio:
+            metadata = sf.info(recording.audio_path)
+            pieces: list[torch.Tensor] = []
+            for span in source_spans:
+                frame_offset = max(
+                    0, math.floor(span.start_seconds * metadata.samplerate)
+                )
+                frame_end = min(
+                    metadata.frames, math.ceil(span.end_seconds * metadata.samplerate)
+                )
+                frames = frame_end - frame_offset
+                if frames <= 0:
+                    continue
+                samples, source_rate = sf.read(
+                    recording.audio_path,
+                    start=frame_offset,
+                    frames=frames,
+                    dtype="float32",
+                    always_2d=True,
+                )
+                if samples.shape[0] == 0:
+                    continue
+                piece = torch.from_numpy(samples).mean(dim=1)
+                if source_rate != self.sample_rate:
+                    piece = torchaudio.functional.resample(
+                        piece, source_rate, self.sample_rate
+                    )
+                pieces.append(piece)
+            if not pieces:
+                raise ValueError(
+                    f"Window {source_spans[0].start_seconds:.6f}.."
+                    f"{source_spans[-1].end_seconds:.6f} has no "
+                    f"readable audio frames in {recording.audio_path}"
+                )
+            waveform = _repeat_to_length(torch.cat(pieces), self.target_samples)
         return {
             "recording_index": window.recording_index,
             "waveform": waveform,
@@ -466,10 +486,17 @@ class MultimodalCollator:
             [item["text"] for item in examples], padding=True, truncation=True,
             max_length=self.max_text_tokens, return_tensors="pt"
         )
+        waveforms = [item["waveform"] for item in examples]
+        if any(waveform is None for waveform in waveforms):
+            if not all(waveform is None for waveform in waveforms):
+                raise ValueError("A batch cannot mix examples with and without audio")
+            waveform_batch = None
+        else:
+            waveform_batch = torch.stack(waveforms)
         return {
             "recording_indices": [item["recording_index"] for item in examples],
             "tokens": tokens,
-            "waveforms": torch.stack([item["waveform"] for item in examples]),
+            "waveforms": waveform_batch,
             "class_labels": torch.tensor(
                 [item["class_label"] for item in examples], dtype=torch.long
             ),

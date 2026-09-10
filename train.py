@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 from collections import defaultdict
 from pathlib import Path
@@ -65,6 +66,51 @@ class RecordingBalancedSampler(Sampler[int]):
         return len(self.indices_by_recording) * self.windows_per_recording
 
 
+class RecordingBalancedWindowSampler(Sampler[int]):
+    """Give each recording equal sampling weight without changing the loss unit."""
+
+    def __init__(self, dataset: MultimodalDataset, seed: int) -> None:
+        indices_by_recording: dict[int, list[int]] = defaultdict(list)
+        for window_index, window in enumerate(dataset.windows):
+            indices_by_recording[window.recording_index].append(window_index)
+        if not indices_by_recording:
+            raise ValueError("Recording-balanced sampling requires eligible recordings")
+        self.indices_by_recording = list(indices_by_recording.values())
+        self.samples_per_epoch = len(dataset)
+        self.generator = torch.Generator().manual_seed(seed)
+
+    def __iter__(self):
+        recording_count = len(self.indices_by_recording)
+        base_count, remainder = divmod(self.samples_per_epoch, recording_count)
+        extra_recordings = set(
+            torch.randperm(recording_count, generator=self.generator)[:remainder].tolist()
+        )
+        selected: list[int] = []
+        for recording_index, indices in enumerate(self.indices_by_recording):
+            sample_count = base_count + int(recording_index in extra_recordings)
+            if sample_count <= len(indices):
+                choices = torch.randperm(len(indices), generator=self.generator)[
+                    :sample_count
+                ].tolist()
+            else:
+                choices = torch.randperm(
+                    len(indices), generator=self.generator
+                ).tolist()
+                choices.extend(
+                    torch.randint(
+                        len(indices),
+                        (sample_count - len(indices),),
+                        generator=self.generator,
+                    ).tolist()
+                )
+            selected.extend(indices[index] for index in choices)
+        order = torch.randperm(len(selected), generator=self.generator).tolist()
+        return iter(selected[index] for index in order)
+
+    def __len__(self) -> int:
+        return self.samples_per_epoch
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train BERT + RDINO on a CSV manifest")
     parser.add_argument("--train-manifest", required=True, type=Path)
@@ -73,14 +119,55 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rdino-checkpoint", required=True, type=Path)
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"))
     parser.add_argument("--text-model", default="mental/mental-bert-base-uncased")
+    parser.add_argument(
+        "--modality",
+        choices=("both", "text", "audio"),
+        default="both",
+        help="Use both modalities, text only, or audio only (default: both)",
+    )
+    parser.add_argument(
+        "--embedding-normalization",
+        choices=("batchnorm", "layernorm"),
+        default="batchnorm",
+        help="Normalize modality embeddings with BatchNorm or LayerNorm",
+    )
+    parser.add_argument(
+        "--disable-text-lora",
+        action="store_true",
+        help="Keep the text backbone fully frozen without text LoRA adapters",
+    )
+    parser.add_argument(
+        "--disable-rdino-lora",
+        action="store_true",
+        help="Keep the RDINO backbone fully frozen without RDINO LoRA adapters",
+    )
+    parser.add_argument(
+        "--update-rdino-batchnorm-stats",
+        action="store_true",
+        help=(
+            "Allow frozen RDINO BatchNorm running statistics to update; by default "
+            "they remain fixed at their pretrained values"
+        ),
+    )
+    parser.add_argument("--lora-rank", type=int, default=2)
+    parser.add_argument("--lora-alpha", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=1,
+        help="Accumulate this many batches before each optimizer update (default: 1)",
+    )
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument(
         "--train-sampling",
-        choices=("recording", "window"),
+        choices=("recording", "balanced_window", "window"),
         default="recording",
-        help="Sample grouped windows per recording (default) or every window each epoch",
+        help=(
+            "Use grouped recording-level loss (recording), equal recording sampling "
+            "with window-level loss (balanced_window), or every window (window)"
+        ),
     )
     parser.add_argument(
         "--train-windows-per-recording",
@@ -103,11 +190,31 @@ def parse_args() -> argparse.Namespace:
         "--early-stopping-patience",
         type=int,
         default=5,
-        help="Stop after this many epochs without recording-level R-squared improvement",
+        help=(
+            "Stop after this many validation events without recording-level "
+            "R-squared improvement"
+        ),
     )
     parser.add_argument("--early-stopping-min-delta", type=float, default=0.0)
+    parser.add_argument(
+        "--validation-interval",
+        type=int,
+        default=1,
+        help=(
+            "Run full validation every N epochs; scheduler and early-stopping "
+            "patience count validation events (default: 1)"
+        ),
+    )
     parser.add_argument("--window-seconds", type=float, default=55.0)
     parser.add_argument("--stride-seconds", type=float, default=10.0)
+    parser.add_argument(
+        "--eligibility-window-seconds",
+        type=float,
+        help=(
+            "Require recordings to support this window length while allowing "
+            "--window-seconds to vary; useful for comparable HPO cohorts"
+        ),
+    )
     parser.add_argument(
         "--stride-jitter-seconds",
         type=float,
@@ -139,6 +246,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--regression-weight", type=float, default=1.0)
     parser.add_argument(
+        "--log-task-gradients",
+        action="store_true",
+        help="Log classification/regression gradient norms and cosine once per epoch",
+    )
+    parser.add_argument(
+        "--task-gradient-batches-per-epoch",
+        type=int,
+        default=1,
+        help="Number of leading training batches to diagnose per epoch (default: 1)",
+    )
+    parser.add_argument(
         "--standardize-regression-labels",
         action="store_true",
         help="Fit mean/std on training-recording labels and train in standardized units",
@@ -147,11 +265,14 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def move_batch(batch: dict, device: torch.device) -> tuple[dict, torch.Tensor, torch.Tensor, torch.Tensor]:
+def move_batch(
+    batch: dict, device: torch.device
+) -> tuple[dict, torch.Tensor | None, torch.Tensor, torch.Tensor]:
     tokens = {name: value.to(device, non_blocking=True) for name, value in batch["tokens"].items()}
+    waveforms = batch["waveforms"]
     return (
         tokens,
-        batch["waveforms"].to(device, non_blocking=True),
+        waveforms.to(device, non_blocking=True) if waveforms is not None else None,
         batch["class_labels"].to(device, non_blocking=True),
         batch["regression_labels"].to(device, non_blocking=True),
     )
@@ -173,7 +294,7 @@ def _regression_standardization(train_data, enabled: bool) -> dict[str, float | 
 def _classification_weighting(
     train_data: MultimodalDataset, num_classes: int, sampling: str, method: str
 ) -> dict[str, str | list[int] | list[float]]:
-    if sampling == "recording":
+    if sampling in {"recording", "balanced_window"}:
         eligible_recordings = sorted(
             {window.recording_index for window in train_data.windows}
         )
@@ -202,6 +323,7 @@ def _classification_weighting(
     return {
         "method": method,
         "sampling_unit": sampling_unit,
+        "loss_normalization": "mean_of_weighted_sample_losses",
         "counts": counts.astype(int).tolist(),
         "weights": weights.tolist(),
     }
@@ -220,6 +342,91 @@ def _restore_regression_scale(
         predictions * float(standardization["std"])
         + float(standardization["mean"])
     )
+
+
+def task_gradient_diagnostics(
+    model: BertRdinoModel,
+    classification_loss: torch.Tensor,
+    regression_loss: torch.Tensor,
+    classification_weight: float,
+    regression_weight: float,
+    epoch: int,
+    batch_number: int,
+) -> list[dict[str, float | int | str | bool]]:
+    """Measure task gradient magnitude and alignment on shared trainable parameters."""
+    groups = model.shared_trainable_parameter_groups()
+    parameters: list[torch.nn.Parameter] = []
+    group_indices: dict[str, list[int]] = {}
+    for group_name, group_parameters in groups.items():
+        indices: list[int] = []
+        for parameter in group_parameters:
+            indices.append(len(parameters))
+            parameters.append(parameter)
+        group_indices[group_name] = indices
+    if not parameters:
+        return []
+
+    classification_gradients = torch.autograd.grad(
+        classification_loss,
+        parameters,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    regression_gradients = torch.autograd.grad(
+        regression_loss,
+        parameters,
+        retain_graph=True,
+        allow_unused=True,
+    )
+
+    def summarize(group_name: str, indices: list[int]):
+        device = parameters[0].device
+        class_squared = torch.zeros((), device=device)
+        regression_squared = torch.zeros((), device=device)
+        dot_product = torch.zeros((), device=device)
+        for index in indices:
+            class_gradient = classification_gradients[index]
+            regression_gradient = regression_gradients[index]
+            if class_gradient is not None:
+                class_squared += class_gradient.detach().float().square().sum()
+            if regression_gradient is not None:
+                regression_squared += regression_gradient.detach().float().square().sum()
+            if class_gradient is not None and regression_gradient is not None:
+                dot_product += (
+                    class_gradient.detach().float()
+                    * regression_gradient.detach().float()
+                ).sum()
+        class_norm = math.sqrt(class_squared.item())
+        regression_norm = math.sqrt(regression_squared.item())
+        denominator = class_norm * regression_norm
+        cosine = dot_product.item() / denominator if denominator > 0 else float("nan")
+        weighted_class_norm = classification_weight * class_norm
+        weighted_regression_norm = regression_weight * regression_norm
+        weighted_ratio = (
+            weighted_class_norm / weighted_regression_norm
+            if weighted_regression_norm > 0
+            else float("nan")
+        )
+        return {
+            "epoch": epoch,
+            "batch": batch_number,
+            "parameter_group": group_name,
+            "parameter_count": sum(parameters[index].numel() for index in indices),
+            "classification_gradient_norm": class_norm,
+            "regression_gradient_norm": regression_norm,
+            "weighted_classification_gradient_norm": weighted_class_norm,
+            "weighted_regression_gradient_norm": weighted_regression_norm,
+            "weighted_class_to_regression_norm_ratio": weighted_ratio,
+            "cosine_similarity": cosine,
+            "gradient_conflict": bool(cosine < 0),
+        }
+
+    rows = [summarize("all_shared", list(range(len(parameters))))]
+    rows.extend(
+        summarize(group_name, indices)
+        for group_name, indices in group_indices.items()
+    )
+    return rows
 
 
 def aggregate_recording_batch(
@@ -355,7 +562,7 @@ def evaluate(
     )
     validation_class_weights = np.asarray(class_weights, dtype=np.float64)[class_truth]
     classification_loss = float(
-        np.average(negative_log_likelihood, weights=validation_class_weights)
+        np.mean(negative_log_likelihood * validation_class_weights)
     )
     regression_loss = float(mean_squared_error(standardized_truth, standardized_predictions))
     regression_rmse = float(np.sqrt(regression_loss))
@@ -388,6 +595,30 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    if args.lora_rank < 1:
+        raise ValueError("--lora-rank must be at least 1")
+    if args.lora_alpha < 1:
+        raise ValueError("--lora-alpha must be at least 1")
+    if args.gradient_accumulation_steps < 1:
+        raise ValueError("--gradient-accumulation-steps must be at least 1")
+    if args.validation_interval < 1:
+        raise ValueError("--validation-interval must be at least 1")
+    if (
+        args.eligibility_window_seconds is not None
+        and args.eligibility_window_seconds <= 0
+    ):
+        raise ValueError("--eligibility-window-seconds must be positive")
+    if args.task_gradient_batches_per_epoch < 1:
+        raise ValueError("--task-gradient-batches-per-epoch must be at least 1")
+    if args.modality == "text" and args.augment_audio:
+        raise ValueError("--augment-audio has no effect with --modality text")
+    serialized_arguments = {
+        name: str(value) if isinstance(value, Path) else value
+        for name, value in vars(args).items()
+    }
+    (args.output_dir / "training_arguments.json").write_text(
+        json.dumps(serialized_arguments, indent=2) + "\n", encoding="utf-8"
+    )
     augmentation_config = {
         "enabled": args.augment_audio,
         "awgn_probability": args.awgn_probability,
@@ -427,6 +658,8 @@ def main() -> None:
         stride_seconds=args.stride_seconds,
         num_classes=args.num_classes,
         include_empty_text=args.include_empty_text,
+        load_audio=args.modality != "text",
+        eligibility_window_seconds=args.eligibility_window_seconds,
     )
     train_data = MultimodalDataset(
         args.train_manifest,
@@ -472,6 +705,7 @@ def main() -> None:
         f"{validation_data.skipped_short_recordings} short)"
     )
     recording_level_training = args.train_sampling == "recording"
+    balanced_window_training = args.train_sampling == "balanced_window"
     if recording_level_training:
         if args.train_windows_per_recording < 1:
             raise ValueError("--train-windows-per-recording must be at least 1")
@@ -484,18 +718,40 @@ def main() -> None:
             train_data, args.seed, args.train_windows_per_recording
         )
         recordings_per_batch = args.batch_size // args.train_windows_per_recording
+    elif balanced_window_training:
+        train_sampler = RecordingBalancedWindowSampler(train_data, args.seed)
+        recordings_per_batch = None
     else:
         train_sampler = None
         recordings_per_batch = None
     samples_per_epoch = len(train_sampler) if train_sampler is not None else len(train_data)
+    batches_per_epoch = math.ceil(samples_per_epoch / args.batch_size)
+    optimizer_steps_per_epoch = math.ceil(
+        batches_per_epoch / args.gradient_accumulation_steps
+    )
     print(
         f"Training sampling: {args.train_sampling}; "
         f"{samples_per_epoch} windows per epoch"
     )
+    print(
+        f"Gradient accumulation: {args.gradient_accumulation_steps}; "
+        f"approximately {optimizer_steps_per_epoch} optimizer steps per epoch"
+    )
+    if args.modality == "text":
+        print("Text-only data path: waveform loading and GPU transfer disabled")
     if recording_level_training:
         print(
             f"Recording-level loss: {args.train_windows_per_recording} windows per "
-            f"recording; {recordings_per_batch} recordings per optimizer batch"
+            f"recording; {recordings_per_batch} recordings per batch; "
+            f"{recordings_per_batch * args.gradient_accumulation_steps} "
+            "recordings per optimizer update"
+        )
+    elif balanced_window_training:
+        eligible_recordings = len(train_sampler.indices_by_recording)
+        mean_windows = len(train_sampler) / eligible_recordings
+        print(
+            "Balanced window-level loss: approximately "
+            f"{mean_windows:.2f} sampled windows per eligible recording"
         )
     train_loader = DataLoader(
         train_data,
@@ -525,19 +781,29 @@ def main() -> None:
         "fusion_dim": 50,
         "num_classes": args.num_classes,
         "dropout": 0.1,
-        "lora_rank": 2,
-        "lora_alpha": 16,
+        "lora_rank": args.lora_rank,
+        "lora_alpha": args.lora_alpha,
         "sample_rate": 16_000,
+        "modality": args.modality,
+        "use_text_lora": not args.disable_text_lora,
+        "use_rdino_lora": not args.disable_rdino_lora,
+        "embedding_normalization": args.embedding_normalization,
+        "freeze_rdino_batchnorm_stats": not args.update_rdino_batchnorm_stats,
     }
     model = BertRdinoModel(**model_config).to(device)
     trainable, total = model.trainable_parameter_counts()
     print(f"Device: {device}; trainable parameters: {trainable:,}/{total:,}")
+    print(f"Model configuration: {json.dumps(model_config)}")
 
     class_weight_tensor = torch.tensor(
         classification_weighting["weights"], dtype=torch.float32, device=device
     )
-    classification_loss = torch.nn.CrossEntropyLoss(weight=class_weight_tensor)
-    recording_classification_loss = torch.nn.NLLLoss(weight=class_weight_tensor)
+    classification_loss = torch.nn.CrossEntropyLoss(
+        weight=class_weight_tensor, reduction="none"
+    )
+    recording_classification_loss = torch.nn.NLLLoss(
+        weight=class_weight_tensor, reduction="none"
+    )
     regression_loss = torch.nn.MSELoss()
     optimizer = AdamW(
         (parameter for parameter in model.parameters() if parameter.requires_grad),
@@ -580,15 +846,17 @@ def main() -> None:
     if args.early_stopping_patience < 1:
         raise ValueError("--early-stopping-patience must be at least 1")
     history: list[dict[str, float | int]] = []
+    gradient_rows: list[dict[str, float | int | str | bool]] = []
     best_validation_r2 = float("-inf")
     epochs_without_improvement = 0
     for epoch in range(args.epochs):
         epoch_learning_rate = float(optimizer.param_groups[0]["lr"])
         model.train()
         total_losses, classification_losses, regression_losses = [], [], []
+        optimizer.zero_grad(set_to_none=True)
         for batch_number, batch in enumerate(train_loader, start=1):
             tokens, waveforms, class_labels, regression_labels = move_batch(batch, device)
-            if audio_augmenter is not None:
+            if audio_augmenter is not None and waveforms is not None:
                 waveforms = audio_augmenter(waveforms)
             class_logits, regression_output = model(tokens, waveforms)
             if recording_level_training:
@@ -606,11 +874,11 @@ def main() -> None:
                 )
                 batch_classification_loss = recording_classification_loss(
                     class_probabilities.clamp_min(1e-12).log(), class_labels
-                )
+                ).mean()
             else:
                 batch_classification_loss = classification_loss(
                     class_logits, class_labels
-                )
+                ).mean()
             regression_targets = _standardize_regression(
                 regression_labels, regression_standardization
             )
@@ -619,15 +887,68 @@ def main() -> None:
                 args.classification_weight * batch_classification_loss
                 + args.regression_weight * batch_regression_loss
             )
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            if (
+                args.log_task_gradients
+                and batch_number <= args.task_gradient_batches_per_epoch
+            ):
+                epoch_gradient_rows = task_gradient_diagnostics(
+                    model,
+                    batch_classification_loss,
+                    batch_regression_loss,
+                    args.classification_weight,
+                    args.regression_weight,
+                    epoch + 1,
+                    batch_number,
+                )
+                gradient_rows.extend(epoch_gradient_rows)
+                all_shared = next(
+                    (
+                        row
+                        for row in epoch_gradient_rows
+                        if row["parameter_group"] == "all_shared"
+                    ),
+                    None,
+                )
+                if all_shared is not None:
+                    print(
+                        "task_gradients "
+                        f"cosine={all_shared['cosine_similarity']:.6f} "
+                        "weighted_class_to_regression_ratio="
+                        f"{all_shared['weighted_class_to_regression_norm_ratio']:.6f}"
+                    )
+            accumulation_start = (
+                (batch_number - 1) // args.gradient_accumulation_steps
+            ) * args.gradient_accumulation_steps
+            accumulation_group_size = min(
+                args.gradient_accumulation_steps,
+                len(train_loader) - accumulation_start,
+            )
+            (loss / accumulation_group_size).backward()
+            update_parameters = (
+                batch_number % args.gradient_accumulation_steps == 0
+                or batch_number == len(train_loader)
+            )
+            if update_parameters:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
             total_losses.append(loss.item())
             classification_losses.append(batch_classification_loss.item())
             regression_losses.append(batch_regression_loss.item())
             if batch_number == 1 or batch_number % 10 == 0:
                 print(f"epoch={epoch + 1} batch={batch_number} loss={loss.item():.6f}")
+
+        print(f"epoch={epoch + 1} mean_train_loss={np.mean(total_losses):.6f}")
+        if gradient_rows:
+            pd.DataFrame(gradient_rows).to_csv(
+                args.output_dir / "gradient_diagnostics.csv", index=False
+            )
+        should_validate = (
+            (epoch + 1) % args.validation_interval == 0
+            or epoch + 1 == args.epochs
+        )
+        if not should_validate:
+            continue
 
         prediction_path = args.output_dir / f"predictions_epoch_{epoch + 1}.csv"
         metrics = evaluate(
@@ -668,7 +989,6 @@ def main() -> None:
             "validation_regression_r2": metrics["regression_r2"],
         })
         pd.DataFrame(history).to_csv(args.output_dir / "training_history.csv", index=False)
-        print(f"epoch={epoch + 1} mean_train_loss={np.mean(total_losses):.6f}")
         print(json.dumps(metrics, indent=2))
 
         validation_r2 = metrics["regression_r2"]
@@ -693,6 +1013,7 @@ def main() -> None:
             "classification_weighting": classification_weighting,
             "audio_augmentation": augmentation_config,
             "training_arguments": vars(args),
+            "gradient_diagnostics": gradient_rows,
         }
         if improved:
             checkpoint_path = args.output_dir / "best_checkpoint.pt"
@@ -701,8 +1022,8 @@ def main() -> None:
             print(f"New best recording-level regression R-squared: {best_validation_r2:.6f}")
         if epochs_without_improvement >= args.early_stopping_patience:
             print(
-                f"Early stopping after {args.early_stopping_patience} epochs "
-                "without recording-level regression R-squared improvement"
+                f"Early stopping after {args.early_stopping_patience} validation "
+                "events without recording-level regression R-squared improvement"
             )
             break
 

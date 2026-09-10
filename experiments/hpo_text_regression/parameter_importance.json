@@ -1,0 +1,9 @@
+{
+  "disable_text_lora": 0.5789626647856772,
+  "weight_decay": 0.1573097530588263,
+  "learning_rate": 0.13567929054022018,
+  "embedding_normalization": 0.08066411687283014,
+  "gradient_accumulation_steps": 0.03262549026749032,
+  "stride_seconds": 0.01229799061283058,
+  "window_seconds": 0.0024606938621254647
+}

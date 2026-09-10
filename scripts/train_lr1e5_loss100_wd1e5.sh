@@ -8,11 +8,14 @@ uv run python train.py \
   --validation-manifest /data/Clinical_vars/canbind_combined_20260806_validation.csv \
   --num-classes 4 \
   --rdino-checkpoint assets/pretrained_rdino.pth \
-  --window-seconds 45 \
-  --stride-seconds 22.5 \
-  --epochs 50 \
+  --window-seconds 30 \
+  --stride-seconds 20 \
+  --epochs 100 \
   --batch-size 8 \
-  --train-windows-per-recording 4 \
+  --train-sampling window \
+  --learning-rate 1e-5 \
+  --classification-weight 2.0 \
+  --weight-decay 1e-5 \
   --workers 0 \
   --early-stopping-patience 5 \
   --standardize-regression-labels \

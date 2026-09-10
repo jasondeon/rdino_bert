@@ -143,6 +143,29 @@ and regression outputs are averaged across a recording's windows before scoring.
 Window predictions are written to `predictions_epoch_N.csv`, while aggregated
 predictions are written to `recording_predictions_epoch_N.csv`.
 
+Frozen RDINO BatchNorm layers keep their pretrained running mean and variance by
+default, even while LoRA adapters are training. Pass
+`--update-rdino-batchnorm-stats` only to reproduce the earlier behavior in which
+those buffers changed during downstream training. The separate modality embedding
+normalizers remain trainable. Select them with
+`--embedding-normalization batchnorm` (the original architecture) or
+`--embedding-normalization layernorm` (batch-independent).
+
+Use `--modality text`, `--modality audio`, or `--modality both` for modality
+ablations. `--disable-text-lora` and `--disable-rdino-lora` keep the corresponding
+pretrained backbone completely frozen. LoRA rank and alpha are exposed through
+`--lora-rank` and `--lora-alpha`.
+
+Pass `--log-task-gradients` to measure classification and regression gradient
+norms and cosine similarity on the shared trainable parameters for the first
+batch of every epoch. Results are written to `gradient_diagnostics.csv`, both for
+all shared parameters and separately for fusion, normalization, and active LoRA
+adapter groups. Increase the number of sampled batches with
+`--task-gradient-batches-per-epoch`; the diagnostic suite uses ten. Negative
+cosine similarity indicates conflicting task directions; the weighted gradient-
+norm ratio shows which task dominates after applying the
+configured loss weights.
+
 Training stops by default after five epochs without improvement in
 recording-level regression R² and writes the best model to `best_checkpoint.pt`.
 Adjust this with `--early-stopping-patience` and `--early-stopping-min-delta`.
@@ -156,8 +179,9 @@ state are saved in `lr_scheduler.json` and `best_checkpoint.pt`.
 
 Classification losses use square-root inverse-frequency class weights by default.
 The frequencies are fitted only on eligible training examples and match the active
-sampling unit: recordings with `--train-sampling recording`, or windows with
-`--train-sampling window`. The weights are normalized to have mean sample weight
+sampling unit: recordings with `--train-sampling recording` or
+`--train-sampling balanced_window`, and windows with `--train-sampling window`.
+The weights are normalized to have mean sample weight
 one and saved to `classification_weighting.json` and the best checkpoint. Pass
 `--class-weighting none` to recover unweighted classification loss.
 
@@ -181,3 +205,35 @@ size with `--train-windows-per-recording`. `--batch-size` counts windows and mus
 be divisible by the group size (for example, batch size 8 with four windows gives
 two recordings per optimizer batch). Pass `--train-sampling window` to restore
 shuffled window-level training.
+
+`--train-sampling balanced_window` is a third mode. It retains ordinary
+window-level losses and the same total number of samples per epoch as `window`,
+but gives every eligible recording the same number of sampled windows (within one
+window when the total is not divisible). Selected windows are globally shuffled,
+so batches do not intentionally group windows from the same recording. This is a
+cleaner test of recording-balanced sampling than the grouped recording-level loss.
+
+## Structural diagnostic suite
+
+Run the focused single-GPU suite with:
+
+```bash
+./scripts/run_diagnostic_experiments.sh
+```
+
+It sequentially runs six single-seed experiments: a frozen-RDINO-BatchNorm
+reference, the balanced-window/LayerNorm multimodal model, text-only, audio-only,
+no LoRA, and ordinary BERT instead of MentalBERT. It never launches concurrent
+GPU jobs. Completed output directories are skipped on a later invocation, while
+an incomplete directory must be moved aside explicitly before retrying.
+
+Outputs are placed under `outputs/diagnostic-suite` by default. Override that
+without editing the script with, for example:
+
+```bash
+OUTPUT_ROOT=outputs/diagnostic-suite-2 ./scripts/run_diagnostic_experiments.sh
+```
+
+After the final run, `report.md`, `summary.csv`, and
+`gradient_summary_by_group.csv` summarize model performance, prediction shrinkage,
+rare-class recall, disagreement between heads, and task-gradient interaction.
