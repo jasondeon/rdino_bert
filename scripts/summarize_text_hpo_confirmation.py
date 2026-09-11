@@ -3,10 +3,17 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from evaluation_metrics import intraclass_correlation_2_1
 
 
 RUN_PATTERN = re.compile(r"trial-(\d+)-seed-(\d+)$")
@@ -58,6 +65,7 @@ def summarize_run(run_dir: Path) -> dict[str, float | int | str] | None:
         prediction_std = float(np.std(prediction, ddof=1))
         diagnostics = {
             "pearson": safe_correlation(truth, prediction),
+            "icc_2_1": intraclass_correlation_2_1(truth, prediction),
             "prediction_target_sd_ratio": (
                 prediction_std / truth_std if truth_std > 0 else float("nan")
             ),
@@ -119,8 +127,8 @@ def write_report(
         "",
         "## Aggregate results",
         "",
-        "| Trial | Configuration | Screening R2 | Seeds | Mean R2 | R2 SD | Min R2 | Max R2 | Mean original RMSE |",
-        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Trial | Configuration | Screening R2 | Seeds | Mean R2 | R2 SD | Mean ICC(2,1) | Min R2 | Max R2 | Mean original RMSE |",
+        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in summary.itertuples(index=False):
         screening_r2 = screening.get(int(row.source_trial), float("nan"))
@@ -128,6 +136,7 @@ def write_report(
             f"| {row.source_trial} | {row.configuration} | "
             f"{formatted(screening_r2)} | {row.seeds} | "
             f"{formatted(row.mean_r2)} | {formatted(row.std_r2)} | "
+            f"{formatted(row.mean_icc_2_1)} | "
             f"{formatted(row.min_r2)} | {formatted(row.max_r2)} | "
             f"{formatted(row.mean_original_rmse)} |"
         )
@@ -137,14 +146,15 @@ def write_report(
             "",
             "## Individual runs",
             "",
-            "| Trial | Seed | Best epoch | R2 | Original RMSE | Pearson r | Prediction/target SD | Mean error |",
-            "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| Trial | Seed | Best epoch | R2 | ICC(2,1) | Original RMSE | Pearson r | Prediction/target SD | Mean error |",
+            "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for row in runs.sort_values(["seed", "source_trial"]).itertuples(index=False):
         lines.append(
             f"| {row.source_trial} | {row.seed} | {row.best_epoch} | "
             f"{formatted(row.validation_r2)} | "
+            f"{formatted(row.icc_2_1)} | "
             f"{formatted(row.validation_rmse_original_scale)} | "
             f"{formatted(row.pearson)} | "
             f"{formatted(row.prediction_target_sd_ratio)} | "
@@ -194,6 +204,7 @@ def main() -> None:
             seeds=("seed", "count"),
             mean_r2=("validation_r2", "mean"),
             std_r2=("validation_r2", "std"),
+            mean_icc_2_1=("icc_2_1", "mean"),
             min_r2=("validation_r2", "min"),
             max_r2=("validation_r2", "max"),
             mean_original_rmse=("validation_rmse_original_scale", "mean"),

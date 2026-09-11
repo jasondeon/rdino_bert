@@ -103,7 +103,15 @@ def main() -> None:
         marker="s",
         label="R²",
     )
-    r2_axis.set_ylabel("R²")
+    if "validation_regression_icc_2_1" in history:
+        r2_axis.plot(
+            epochs,
+            history["validation_regression_icc_2_1"],
+            color="tab:green",
+            marker="^",
+            label="ICC(2,1)",
+        )
+    r2_axis.set_ylabel("R² / ICC(2,1)")
     lines = regression_axis.lines + r2_axis.lines
     regression_axis.legend(lines, [line.get_label() for line in lines], loc="best")
 

@@ -2,11 +2,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from sklearn.metrics import confusion_matrix
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from evaluation_metrics import intraclass_correlation_2_1
 
 
 def parse_args() -> argparse.Namespace:
@@ -50,6 +57,7 @@ def prediction_diagnostics(run_dir: Path, best_epoch: int) -> dict[str, float | 
     result: dict[str, float | int] = {
         "recordings": len(frame),
         "regression_pearson": safe_correlation(truth, prediction),
+        "regression_icc_2_1": intraclass_correlation_2_1(truth, prediction),
         "prediction_target_sd_ratio": (
             prediction_std / truth_std if truth_std > 0 else float("nan")
         ),
@@ -181,6 +189,7 @@ def main() -> None:
         ("run", "Run"),
         ("validation_r2", "R²"),
         ("validation_rmse", "RMSE"),
+        ("regression_icc_2_1", "ICC(2,1)"),
         ("balanced_accuracy", "BA"),
         ("prediction_target_sd_ratio", "Pred/target SD"),
         ("class_0_recall", "Recall 0"),

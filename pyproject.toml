@@ -17,6 +17,7 @@ dependencies = [
     "torch==2.11.0",
     "torchaudio==2.11.0",
     "transformers>=4.40,<5",
+    "umap-learn>=0.5,<1",
 ]
 
 [tool.uv]

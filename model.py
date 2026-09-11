@@ -8,6 +8,7 @@ from speakerlab.utils.builder import build
 from speakerlab.utils.config import build_config
 from speakerlab.utils.utils import load_params
 from torch import nn
+from torch.nn import functional as F
 from torchaudio import transforms
 from transformers import AutoModel
 
@@ -28,11 +29,29 @@ def _bert_feed_forward_targets(module: nn.Module) -> list[str]:
     ]
 
 
-def _rdino_feed_forward_targets(module: nn.Module) -> list[str]:
-    """Target the terminal attentive-pooling and embedding transformations."""
-    candidates = ("asp.tdnn.conv.conv", "asp.conv.conv", "fc.conv")
+def _rdino_lora_targets(module: nn.Module, scope: str) -> list[str]:
+    """Select increasingly broad ECAPA-TDNN Conv1d adapter scopes."""
+    terminal = ("asp.tdnn.conv.conv", "asp.conv.conv", "fc.conv")
+    if scope == "terminal":
+        candidates = terminal
+    elif scope == "mfa_pooling":
+        candidates = ("mfa.conv.conv", *terminal)
+    elif scope == "all_pointwise":
+        return [
+            name
+            for name, child in module.named_modules()
+            if isinstance(child, nn.Conv1d)
+            and child.kernel_size == (1,)
+        ]
+    else:
+        raise ValueError(f"Unknown RDINO LoRA scope: {scope}")
     available = dict(module.named_modules())
     return [name for name in candidates if isinstance(available.get(name), nn.Conv1d)]
+
+
+class L2Normalize(nn.Module):
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        return F.normalize(values, p=2, dim=1)
 
 
 def _embedding_normalization(kind: str, dimension: int) -> nn.Module:
@@ -40,6 +59,10 @@ def _embedding_normalization(kind: str, dimension: int) -> nn.Module:
         return nn.BatchNorm1d(dimension)
     if kind == "layernorm":
         return nn.LayerNorm(dimension)
+    if kind == "l2":
+        return L2Normalize()
+    if kind == "none":
+        return nn.Identity()
     raise ValueError(f"Unknown embedding normalization: {kind}")
 
 
@@ -61,7 +84,9 @@ class BertRdinoModel(nn.Module):
         modality: str = "both",
         use_text_lora: bool = True,
         use_rdino_lora: bool = True,
+        rdino_lora_scope: str = "terminal",
         embedding_normalization: str = "batchnorm",
+        fusion_architecture: str = "two_layer",
         freeze_rdino_batchnorm_stats: bool = True,
     ) -> None:
         super().__init__()
@@ -115,7 +140,7 @@ class BertRdinoModel(nn.Module):
             rdino_backbone = rdino_model.backbone
 
             if use_rdino_lora:
-                targets = _rdino_feed_forward_targets(rdino_backbone)
+                targets = _rdino_lora_targets(rdino_backbone, rdino_lora_scope)
                 if not targets:
                     raise RuntimeError(
                         "Expected RDINO pooling/output layers were not found for LoRA"
@@ -147,14 +172,22 @@ class BertRdinoModel(nn.Module):
             )
             fusion_input_dim += audio_embedding_dim
 
-        self.fusion = nn.Sequential(
-            nn.Linear(fusion_input_dim, fusion_hidden_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(fusion_hidden_dim, fusion_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-        )
+        if fusion_architecture == "two_layer":
+            self.fusion = nn.Sequential(
+                nn.Linear(fusion_input_dim, fusion_hidden_dim),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+                nn.Linear(fusion_hidden_dim, fusion_dim),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+            )
+        elif fusion_architecture == "single_layer":
+            self.fusion = nn.Sequential(
+                nn.Linear(fusion_input_dim, fusion_dim),
+                nn.SiLU(),
+            )
+        else:
+            raise ValueError(f"Unknown fusion architecture: {fusion_architecture}")
         self.classifier = nn.Linear(fusion_dim, num_classes)
         self.regressor = nn.Linear(fusion_dim, 1)
         self._configure_trainable_parameters()

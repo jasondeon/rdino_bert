@@ -214,8 +214,15 @@ def read_diarization(path: str | Path) -> list[DiarizationSegment]:
 
 
 def _primary_speaker_groups(
-    segments: list[DiarizationSegment],
+    segments: list[DiarizationSegment], gap_policy: str = "preserve",
 ) -> tuple[str, list[tuple[SourceSpan, ...]]]:
+    """Return continuous primary-speaker runs separated by another speaker.
+
+    Consecutive diarization segments from the primary speaker are joined across
+    unlabeled time so natural pauses and diarizer-missed speech remain in the
+    waveform. A detected non-primary segment always starts a new run, preventing
+    windows from crossing a speaker switch.
+    """
     speakers = sorted({segment.speaker for segment in segments})
     primary = max(
         speakers,
@@ -225,6 +232,8 @@ def _primary_speaker_groups(
             if segment.speaker == speaker
         ),
     )
+    if gap_policy not in {"preserve", "concatenate"}:
+        raise ValueError(f"Unknown speaker gap policy: {gap_policy}")
     groups: list[list[SourceSpan]] = []
     previous_speaker: str | None = None
     for segment in segments:
@@ -237,13 +246,18 @@ def _primary_speaker_groups(
         else:
             groups.append([span])
         previous_speaker = primary
+    if gap_policy == "preserve":
+        return primary, [
+            (SourceSpan(group[0].start_seconds, group[-1].end_seconds),)
+            for group in groups
+        ]
     return primary, [tuple(group) for group in groups]
 
 
 def _source_spans_for_window(
     group: tuple[SourceSpan, ...], start: float, end: float
 ) -> tuple[SourceSpan, ...]:
-    """Map a window in one concatenated same-speaker run to source spans."""
+    """Map a local window into its continuous or concatenated source run."""
     result: list[SourceSpan] = []
     cursor = 0.0
     for span in group:
@@ -311,6 +325,7 @@ class MultimodalDataset(Dataset[dict[str, Any]]):
         window_jitter_seconds: float = 0.0,
         load_audio: bool = True,
         eligibility_window_seconds: float | None = None,
+        speaker_gap_policy: str = "preserve",
     ) -> None:
         if window_seconds <= 0 or stride_seconds <= 0:
             raise ValueError("window_seconds and stride_seconds must be positive")
@@ -318,6 +333,10 @@ class MultimodalDataset(Dataset[dict[str, Any]]):
             raise ValueError("window_jitter_seconds cannot be negative")
         if eligibility_window_seconds is not None and eligibility_window_seconds <= 0:
             raise ValueError("eligibility_window_seconds must be positive")
+        if speaker_gap_policy not in {"preserve", "concatenate"}:
+            raise ValueError(
+                "speaker_gap_policy must be 'preserve' or 'concatenate'"
+            )
         self.recordings = read_manifest(manifest_path, num_classes=num_classes)
         self.sample_rate = sample_rate
         self.window_seconds = window_seconds
@@ -329,6 +348,7 @@ class MultimodalDataset(Dataset[dict[str, Any]]):
             if eligibility_window_seconds is None
             else eligibility_window_seconds
         )
+        self.speaker_gap_policy = speaker_gap_policy
         self.target_samples = round(sample_rate * window_seconds)
         self.words_by_recording: list[list[TimedWord]] = []
         self.windows: list[Window] = []
@@ -346,7 +366,9 @@ class MultimodalDataset(Dataset[dict[str, Any]]):
             words = read_word_timestamps(recording.word_timestamps_path)
             self.words_by_recording.append(words)
             diarization = read_diarization(recording.diarization_path)
-            primary_speaker, speaker_groups = _primary_speaker_groups(diarization)
+            primary_speaker, speaker_groups = _primary_speaker_groups(
+                diarization, gap_policy=speaker_gap_policy
+            )
             speaker_groups = [
                 tuple(
                     SourceSpan(span.start_seconds, min(span.end_seconds, duration))

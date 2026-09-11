@@ -24,6 +24,7 @@ from transformers import AutoTokenizer
 
 from augmentation import WaveformAugmenter
 from dataset import MultimodalCollator, MultimodalDataset
+from evaluation_metrics import intraclass_correlation_2_1
 from model import BertRdinoModel
 
 
@@ -127,9 +128,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--embedding-normalization",
-        choices=("batchnorm", "layernorm"),
+        choices=("batchnorm", "layernorm", "l2", "none"),
         default="batchnorm",
-        help="Normalize modality embeddings with BatchNorm or LayerNorm",
+        help="Normalization applied to each modality embedding",
+    )
+    parser.add_argument(
+        "--fusion-architecture",
+        choices=("two_layer", "single_layer"),
+        default="two_layer",
+        help=(
+            "Two-layer fusion MLP or the colleague-style single Linear+SiLU "
+            "head (default: two_layer)"
+        ),
     )
     parser.add_argument(
         "--disable-text-lora",
@@ -140,6 +150,15 @@ def parse_args() -> argparse.Namespace:
         "--disable-rdino-lora",
         action="store_true",
         help="Keep the RDINO backbone fully frozen without RDINO LoRA adapters",
+    )
+    parser.add_argument(
+        "--rdino-lora-scope",
+        choices=("terminal", "mfa_pooling", "all_pointwise"),
+        default="terminal",
+        help=(
+            "Adapt terminal pooling/output convolutions, include MFA, or adapt "
+            "all shape-safe 1x1 RDINO Conv1d layers (default: terminal)"
+        ),
     )
     parser.add_argument(
         "--update-rdino-batchnorm-stats",
@@ -176,6 +195,21 @@ def parse_args() -> argparse.Namespace:
         help="Windows averaged for each recording-level training loss (default: 4)",
     )
     parser.add_argument("--learning-rate", type=float, default=3e-5)
+    parser.add_argument(
+        "--text-learning-rate",
+        type=float,
+        help="Optional text-adapter LR; defaults to --learning-rate",
+    )
+    parser.add_argument(
+        "--audio-learning-rate",
+        type=float,
+        help="Optional RDINO-adapter LR; defaults to --learning-rate",
+    )
+    parser.add_argument(
+        "--head-learning-rate",
+        type=float,
+        help="Optional normalization/fusion/head LR; defaults to --learning-rate",
+    )
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument(
         "--lr-scheduler",
@@ -213,6 +247,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Require recordings to support this window length while allowing "
             "--window-seconds to vary; useful for comparable HPO cohorts"
+        ),
+    )
+    parser.add_argument(
+        "--speaker-gap-policy",
+        choices=("preserve", "concatenate"),
+        default="preserve",
+        help=(
+            "Preserve unlabeled time between consecutive primary-speaker segments "
+            "or remove it by concatenation (default: preserve)"
         ),
     )
     parser.add_argument(
@@ -342,6 +385,69 @@ def _restore_regression_scale(
         predictions * float(standardization["std"])
         + float(standardization["mean"])
     )
+
+
+def _optimizer_parameter_groups(
+    model: BertRdinoModel, args: argparse.Namespace
+) -> list[dict]:
+    """Separate backbone adapters from task heads for discriminative LRs."""
+    learning_rates = {
+        "text": (
+            args.text_learning_rate
+            if args.text_learning_rate is not None
+            else args.learning_rate
+        ),
+        "audio": (
+            args.audio_learning_rate
+            if args.audio_learning_rate is not None
+            else args.learning_rate
+        ),
+        "head": (
+            args.head_learning_rate
+            if args.head_learning_rate is not None
+            else args.learning_rate
+        ),
+    }
+    parameters: dict[str, list[torch.nn.Parameter]] = {
+        "text": [],
+        "audio": [],
+        "head": [],
+    }
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if name.startswith("text_model."):
+            parameters["text"].append(parameter)
+        elif name.startswith("rdino_backbone."):
+            parameters["audio"].append(parameter)
+        else:
+            parameters["head"].append(parameter)
+
+    groups = []
+    for group_name in ("text", "audio", "head"):
+        if parameters[group_name]:
+            groups.append(
+                {
+                    "params": parameters[group_name],
+                    "lr": learning_rates[group_name],
+                    "group_name": group_name,
+                }
+            )
+    return groups
+
+
+def _optimizer_learning_rates(optimizer: AdamW) -> dict[str, float]:
+    return {
+        str(group.get("group_name", f"group_{index}")): float(group["lr"])
+        for index, group in enumerate(optimizer.param_groups)
+    }
+
+
+def _primary_learning_rate(learning_rates: dict[str, float]) -> float:
+    """Keep the historic scalar column useful for plots and old summaries."""
+    if "head" in learning_rates:
+        return learning_rates["head"]
+    return next(iter(learning_rates.values()))
 
 
 def task_gradient_diagnostics(
@@ -569,6 +675,9 @@ def evaluate(
     regression_rmse_original_scale = float(
         np.sqrt(mean_squared_error(regression_truth, regression_predictions))
     )
+    regression_icc_2_1 = intraclass_correlation_2_1(
+        regression_truth, regression_predictions
+    )
     return {
         "classification_loss": classification_loss,
         "regression_loss": regression_loss,
@@ -582,6 +691,7 @@ def evaluate(
         "regression_rmse": regression_rmse,
         "regression_rmse_original_scale": regression_rmse_original_scale,
         "regression_r2": float(r2_score(standardized_truth, standardized_predictions)),
+        "regression_icc_2_1": regression_icc_2_1,
     }
 
 
@@ -599,6 +709,15 @@ def main() -> None:
         raise ValueError("--lora-rank must be at least 1")
     if args.lora_alpha < 1:
         raise ValueError("--lora-alpha must be at least 1")
+    learning_rate_arguments = {
+        "--learning-rate": args.learning_rate,
+        "--text-learning-rate": args.text_learning_rate,
+        "--audio-learning-rate": args.audio_learning_rate,
+        "--head-learning-rate": args.head_learning_rate,
+    }
+    for option, value in learning_rate_arguments.items():
+        if value is not None and value <= 0:
+            raise ValueError(f"{option} must be positive")
     if args.gradient_accumulation_steps < 1:
         raise ValueError("--gradient-accumulation-steps must be at least 1")
     if args.validation_interval < 1:
@@ -660,6 +779,7 @@ def main() -> None:
         include_empty_text=args.include_empty_text,
         load_audio=args.modality != "text",
         eligibility_window_seconds=args.eligibility_window_seconds,
+        speaker_gap_policy=args.speaker_gap_policy,
     )
     train_data = MultimodalDataset(
         args.train_manifest,
@@ -787,7 +907,9 @@ def main() -> None:
         "modality": args.modality,
         "use_text_lora": not args.disable_text_lora,
         "use_rdino_lora": not args.disable_rdino_lora,
+        "rdino_lora_scope": args.rdino_lora_scope,
         "embedding_normalization": args.embedding_normalization,
+        "fusion_architecture": args.fusion_architecture,
         "freeze_rdino_batchnorm_stats": not args.update_rdino_batchnorm_stats,
     }
     model = BertRdinoModel(**model_config).to(device)
@@ -805,17 +927,24 @@ def main() -> None:
         weight=class_weight_tensor, reduction="none"
     )
     regression_loss = torch.nn.MSELoss()
-    optimizer = AdamW(
-        (parameter for parameter in model.parameters() if parameter.requires_grad),
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay,
-    )
+    optimizer_groups = _optimizer_parameter_groups(model, args)
+    optimizer = AdamW(optimizer_groups, weight_decay=args.weight_decay)
+    initial_learning_rates = _optimizer_learning_rates(optimizer)
+    for group in optimizer.param_groups:
+        parameter_count = sum(parameter.numel() for parameter in group["params"])
+        print(
+            f"Optimizer group {group['group_name']}: "
+            f"lr={group['lr']:.8g}; parameters={parameter_count:,}"
+        )
     if not 0.0 < args.lr_scheduler_factor < 1.0:
         raise ValueError("--lr-scheduler-factor must be between 0 and 1")
     if args.lr_scheduler_patience < 0:
         raise ValueError("--lr-scheduler-patience cannot be negative")
-    if not 0.0 <= args.min_learning_rate <= args.learning_rate:
-        raise ValueError("--min-learning-rate must be between 0 and --learning-rate")
+    if not 0.0 <= args.min_learning_rate <= min(initial_learning_rates.values()):
+        raise ValueError(
+            "--min-learning-rate must be between 0 and the smallest active "
+            "optimizer-group learning rate"
+        )
     scheduler_config = {
         "name": args.lr_scheduler,
         "monitor": "validation_regression_r2",
@@ -824,6 +953,7 @@ def main() -> None:
         "patience": args.lr_scheduler_patience,
         "threshold": args.early_stopping_min_delta,
         "min_learning_rate": args.min_learning_rate,
+        "initial_group_learning_rates": initial_learning_rates,
     }
     (args.output_dir / "lr_scheduler.json").write_text(
         json.dumps(scheduler_config, indent=2) + "\n", encoding="utf-8"
@@ -850,7 +980,8 @@ def main() -> None:
     best_validation_r2 = float("-inf")
     epochs_without_improvement = 0
     for epoch in range(args.epochs):
-        epoch_learning_rate = float(optimizer.param_groups[0]["lr"])
+        epoch_learning_rates = _optimizer_learning_rates(optimizer)
+        epoch_learning_rate = _primary_learning_rate(epoch_learning_rates)
         model.train()
         total_losses, classification_losses, regression_losses = [], [], []
         optimizer.zero_grad(set_to_none=True)
@@ -963,16 +1094,38 @@ def main() -> None:
         )
         if scheduler is not None:
             scheduler.step(metrics["regression_r2"])
-        next_learning_rate = float(optimizer.param_groups[0]["lr"])
-        if next_learning_rate < epoch_learning_rate:
+        next_learning_rates = _optimizer_learning_rates(optimizer)
+        next_learning_rate = _primary_learning_rate(next_learning_rates)
+        reduced_groups = [
+            group_name
+            for group_name, learning_rate in epoch_learning_rates.items()
+            if next_learning_rates[group_name] < learning_rate
+        ]
+        if reduced_groups:
             print(
-                f"Reduced learning rate: {epoch_learning_rate:.8g} -> "
-                f"{next_learning_rate:.8g}"
+                "Reduced learning rates: "
+                + ", ".join(
+                    f"{group_name} {epoch_learning_rates[group_name]:.8g} -> "
+                    f"{next_learning_rates[group_name]:.8g}"
+                    for group_name in reduced_groups
+                )
             )
         history.append({
             "epoch": epoch + 1,
             "learning_rate": epoch_learning_rate,
             "next_learning_rate": next_learning_rate,
+            "text_learning_rate": epoch_learning_rates.get("text", float("nan")),
+            "audio_learning_rate": epoch_learning_rates.get("audio", float("nan")),
+            "head_learning_rate": epoch_learning_rates.get("head", float("nan")),
+            "next_text_learning_rate": next_learning_rates.get(
+                "text", float("nan")
+            ),
+            "next_audio_learning_rate": next_learning_rates.get(
+                "audio", float("nan")
+            ),
+            "next_head_learning_rate": next_learning_rates.get(
+                "head", float("nan")
+            ),
             "train_total_loss": float(np.mean(total_losses)),
             "train_classification_loss": float(np.mean(classification_losses)),
             "train_regression_loss": float(np.mean(regression_losses)),
@@ -987,6 +1140,7 @@ def main() -> None:
                 "regression_rmse_original_scale"
             ],
             "validation_regression_r2": metrics["regression_r2"],
+            "validation_regression_icc_2_1": metrics["regression_icc_2_1"],
         })
         pd.DataFrame(history).to_csv(args.output_dir / "training_history.csv", index=False)
         print(json.dumps(metrics, indent=2))
